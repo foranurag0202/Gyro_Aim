@@ -1,0 +1,129 @@
+#include <Wire.h>
+#include <MPU6050.h>
+#include <esp_now.h>
+#include <WiFi.h>
+
+MPU6050 mpu;
+
+int16_t gx, gy, gz;
+
+float zAngle = 90, xAngle = 90;
+float gyroBiasZ = 0, gyroBiasX = 0;
+
+unsigned long lastTime = 0;
+unsigned long lastGoodRead = 0;
+const unsigned long MAX_FREEZE_TIME = 2000; // 2 seconds
+
+// Define structure for angle data
+typedef struct struct_message {
+  float xAngle;
+  float zAngle;
+} struct_message;
+
+struct_message angleData;
+
+// Replace with receiver MAC address
+uint8_t receiverMac[] = {0xFC,0xB4,0x67,0x50,0xBA,0x34};
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverMac, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+    return;
+  }
+
+  mpu.initialize();
+
+  if (mpu.testConnection()) {
+    Serial.println("MPU6050 connected.");
+  } else {
+    Serial.println("MPU6050 connection failed!");
+    while (1);
+  }
+
+  Serial.println("Calibrating gyro, keep MPU6050 steady...");
+  long sumGZ = 0, sumGX = 0;
+  int samples = 500;
+  for (int i = 0; i < samples; i++) {
+    mpu.getRotation(&gx, &gy, &gz);
+    sumGZ += gz;
+    sumGX += gx;
+    delay(5);
+  }
+  gyroBiasZ = sumGZ / (float)samples;
+  gyroBiasX = sumGX / (float)samples;
+
+  Serial.print("Gyro bias Z: "); Serial.print(gyroBiasZ);
+  Serial.print(" | X: "); Serial.println(gyroBiasX);
+
+  lastTime = millis();
+  lastGoodRead = millis();
+}
+
+void loop() {
+  unsigned long now = millis();
+  float dt = (now - lastTime) / 1000.0;
+  lastTime = now;
+
+  int16_t prevGX = gx;
+  int16_t prevGZ = gz;
+
+  mpu.getRotation(&gx, &gy, &gz);
+
+  if (gx != prevGX || gz != prevGZ) {
+    lastGoodRead = millis();
+  }
+
+  if ((millis() - lastGoodRead) > MAX_FREEZE_TIME) {
+    Serial.println("MPU6050 frozen, reinitializing...");
+    mpu.initialize();
+    delay(100);
+    return;
+  }
+
+  float sensitivity = 131.0;
+  float gz_dps = (gz - gyroBiasZ) / sensitivity;
+  float gx_dps = (gx - gyroBiasX) / sensitivity;
+
+  gz_dps = constrain(gz_dps, -200, 200);
+  gx_dps = constrain(gx_dps, -200, 200);
+
+  zAngle += gz_dps * dt;
+  xAngle += gx_dps * dt;
+
+  zAngle = constrain(zAngle, -180, 360);
+  xAngle = constrain(xAngle, -180, 360);
+
+  //if (abs(gz_dps) < 1.5) zAngle *= 0.98;
+  //if (abs(gx_dps) < 1.5) xAngle *= 0.98;
+
+  zAngle = constrain(zAngle, 0, 180);
+  xAngle = constrain(xAngle, 0, 180);
+
+  angleData.xAngle = xAngle;
+  angleData.zAngle = zAngle;
+
+  esp_err_t result = esp_now_send(receiverMac, (uint8_t *)&angleData, sizeof(angleData));
+  if (result == ESP_OK) {
+    Serial.print("Sent -> X: "); Serial.print(xAngle);
+    Serial.print(" | Z: "); Serial.println(zAngle);
+  } else {
+    Serial.println("Failed to send data");
+  }
+
+  delay(50);
+} 
